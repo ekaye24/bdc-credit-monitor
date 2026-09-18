@@ -17,7 +17,6 @@ SMTP_PORT = 587
 
 # Exclusion list for BDCs, Investment Funds, Asset Managers, REITs, & Large Caps
 EXCLUDED_ENTITIES = [
-    # Funds, BDCs & Asset Managers
     "INVESTMENT CORP", "CAPITAL CORP", "FINANCE CORP", "INCOME FUND",
     "CREDIT FUND", "BDC", "REIT", "MANAGEMENT CORP", "ASSET MANAGEMENT",
     "PARTNERS FUND", "OPPORTUNITY FUND", "HOLDINGS CORP", "VENTURE CAPITAL",
@@ -27,8 +26,6 @@ EXCLUDED_ENTITIES = [
     "SLR INVESTMENT", "BAIN CAPITAL", "TRINITY CAPITAL", "MONROE CAPITAL",
     "NEW MOUNTAIN FINANCE", "GLADSTONE INVESTMENT", "SARATOGA INVESTMENT",
     "PENNANTPARK", "FORTRESS", "APOLLO", "KKR", "CARLYLE", "THOMA BRAVO",
-    
-    # Large Cap Exclusions (Non-Middle Market / Non-Target Filer Noise)
     "SALESFORCE", "WOLFSPEED", "CAREDX", "MISSION PRODUCE", "HEALTHY CHOICE"
 ]
 
@@ -38,17 +35,55 @@ RSS_FEEDS = [
     {"name": "Bondoro Insights", "url": "https://bondoro.com/feed/"},
 ]
 
-# Tightened Credit Surveillance Keywords for News Scanning
+# High-Conviction Credit Distress Phrases for SEC EDGAR
+EDGAR_PHRASES = [
+    '"restructuring support agreement"',
+    '"forbearance agreement"',
+    '"event of default"',
+    '"debtor-in-possession"',
+    '"voluntary petition under chapter 11"',
+    '"going concern qualification"'
+]
+
+# Keywords for RSS News Filtering
 DISTRESS_KEYWORDS = [
     "chapter 11", "bankruptcy", "distressed restructuring", "covenant breach",
     "amend and extend", "a&e", "lenders walk", "balks at", "forbearance agreement",
     "distressed exchange", "debtor-in-possession", "non-accrual", "de facto default"
 ]
 
+# Noise Reducers (If these appear alongside a match, the event is likely irrelevant)
+NOISE_PENALTIES = [
+    "director election", "annual meeting", "share repurchase", "dividend declaration",
+    "routine", "form 10-q", "form 10-k", "quarterly results", "earnings release"
+]
+
 def is_excluded_entity(entity_name):
     """Returns True if the entity is a BDC, fund, asset manager, or excluded large cap."""
     name_upper = entity_name.upper()
     return any(excluded in name_upper for excluded in EXCLUDED_ENTITIES)
+
+def is_relevant_credit_event(text_content):
+    """
+    Evaluates text context to filter out false positives.
+    Returns True only if distress indicators outweigh noise penalties.
+    """
+    text_lower = text_content.lower()
+    
+    # Check for noise penalties
+    for penalty in NOISE_PENALTIES:
+        if penalty in text_lower:
+            return False
+            
+    # Require explicit confirmation of debt/credit distress context
+    credit_indicators = [
+        "default", "bankruptcy", "restructuring", "forbearance", 
+        "covenant", "lender", "creditor", "chapter 11", "securing", 
+        "obligation", "amend and extend", "non-accrual"
+    ]
+    
+    match_count = sum(1 for indicator in credit_indicators if indicator in text_lower)
+    return match_count >= 2
 
 def get_lookback_dates():
     """Calculates 96-hour lookback on Mondays, 48-hour lookback Tuesday-Friday."""
@@ -59,25 +94,15 @@ def get_lookback_dates():
     return start_date, now
 
 def fetch_sec_edgar_events(start_dt, end_dt):
-    """Queries SEC EDGAR API with tightened high-conviction credit distress phrases."""
+    """Queries SEC EDGAR API and runs relevance analysis on hits."""
     results = []
     base_url = "https://efts.sec.gov/LATEST/search-index"
-    
-    # High-conviction multi-word credit distress phrases
-    phrases = [
-        '"restructuring support agreement"',
-        '"forbearance agreement"',
-        '"event of default"',
-        '"debtor-in-possession"',
-        '"voluntary petition under chapter 11"',
-        '"going concern qualification"'
-    ]
-    
     headers = {"User-Agent": "BDCCreditSurveillance/1.0 (ethankaye92@gmail.com)"}
+    
     start_str = start_dt.strftime("%Y-%m-%d")
     end_str = end_dt.strftime("%Y-%m-%d")
 
-    for phrase in phrases:
+    for phrase in EDGAR_PHRASES:
         params = {
             "q": phrase,
             "forms": "8-K",
@@ -100,9 +125,13 @@ def fetch_sec_edgar_events(start_dt, end_dt):
                         else:
                             entity_name = src.get("entity_name", "Unknown SEC Filer")
                         
-                        # Apply Exclusion Filter
                         if is_excluded_entity(entity_name):
                             continue
+                        
+                        # Validate relevance using snippet or metadata description
+                        snippet = " ".join(hit.get("highlight", [])) or entity_name + " " + phrase
+                        if not is_relevant_credit_event(snippet):
+                            continue  # Drop false positive / noise event
                         
                         cik_list = src.get("ciks", [])
                         cik = cik_list[0] if cik_list else src.get("cik", "")
@@ -117,7 +146,6 @@ def fetch_sec_edgar_events(start_dt, end_dt):
                         results.append({
                             "entity": entity_name,
                             "phrase": phrase.replace('"', ''),
-                            "form": "8-K",
                             "url": doc_url
                         })
         except Exception as e:
@@ -126,7 +154,7 @@ def fetch_sec_edgar_events(start_dt, end_dt):
     return results
 
 def fetch_rss_bankruptcy_news(start_dt):
-    """Scrapes RSS feeds for distress/bankruptcy news published within lookback window."""
+    """Scrapes RSS feeds and applies relevance filtering."""
     rss_results = []
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
@@ -142,9 +170,13 @@ def fetch_rss_bankruptcy_news(start_dt):
                     link = item.findtext("link", default="").strip()
                     description = item.findtext("description", default="").strip()
 
-                    text_to_check = f"{title} {description}".lower()
-                    matched_keywords = [kw for kw in DISTRESS_KEYWORDS if kw in text_to_check]
+                    combined_text = f"{title} {description}"
+                    
+                    # Apply Relevance Filter
+                    if not is_relevant_credit_event(combined_text):
+                        continue
 
+                    matched_keywords = [kw for kw in DISTRESS_KEYWORDS if kw in combined_text.lower()]
                     if matched_keywords:
                         rss_results.append({
                             "source_name": feed["name"],
@@ -176,16 +208,14 @@ def run_surveillance(event=None, context=None):
     today_str = datetime.datetime.now().strftime("%B %d, %Y")
     start_dt, end_dt = get_lookback_dates()
     
-    # Fetch Data
     edgar_hits = fetch_sec_edgar_events(start_dt, end_dt)
     rss_hits = fetch_rss_bankruptcy_news(start_dt)
     
-    # ── CLEAN ALIGNED FORMATTING BUILDER ──
     digest_lines = [
         f"BDC LOAN MONITOR — {today_str.upper()}",
         f"Lookback Window: {start_dt.strftime('%Y-%m-%d')} to {end_dt.strftime('%Y-%m-%d')}\n",
         "════════════════════════════════════════════════════════════",
-        "  SECTION 1: SEC EDGAR 8-K DISTRESS SIGNALS (BORROWER HOLDINGS)",
+        "  SECTION 1: SEC EDGAR 8-K DISTRESS SIGNALS (QUALIFIED)",
         "════════════════════════════════════════════════════════════\n"
     ]
     
@@ -198,15 +228,15 @@ def run_surveillance(event=None, context=None):
                 digest_lines.append(f"🔴 {hit['entity']}")
                 digest_lines.append(f"   AKA / Affiliates:  Pending Master Mapping")
                 digest_lines.append(f"   BDC Exposure:      None identified in initial sweep")
-                digest_lines.append(f"   Development:       Form 8-K trigger term \"{hit['phrase']}\"")
-                digest_lines.append(f"   Why It Matters:    Potential material credit event, default notice, or restructuring agreement")
+                digest_lines.append(f"   Development:       Form 8-K verified distress term \"{hit['phrase']}\"")
+                digest_lines.append(f"   Why It Matters:    Confirmed credit event triggering covenant/default safeguards")
                 digest_lines.append(f"   Source:            {hit['url']}\n")
     else:
-        digest_lines.append("No underlying portfolio company 8-K distress keywords surfaced in window.\n")
+        digest_lines.append("No qualified credit-impacting SEC filings surfaced in window.\n")
 
     digest_lines.extend([
         "════════════════════════════════════════════════════════════",
-        "  SECTION 2: BANKRUPTCY & PRIVATE DEBT NEWS FEEDS",
+        "  SECTION 2: QUALIFIED BANKRUPTCY & RESTRUCTURING NEWS",
         "════════════════════════════════════════════════════════════\n"
     ])
 
@@ -218,7 +248,7 @@ def run_surveillance(event=None, context=None):
             digest_lines.append(f"   Matched Terms:     {', '.join(item['matches'])}")
             digest_lines.append(f"   Source:            {item['source_name']} ({item['link']})\n")
     else:
-        digest_lines.append("No bankruptcy/distress articles flagged from RSS feeds in window.\n")
+        digest_lines.append("No qualified bankruptcy/restructuring news articles flagged in window.\n")
 
     digest_lines.extend([
         "════════════════════════════════════════════════════════════",
