@@ -15,18 +15,39 @@ SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")  # Gmail App Password
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
 
+# Exclusion list for BDCs, Investment Funds, Asset Managers, REITs, & Financial Vehicles
+EXCLUDED_ENTITIES = [
+    # Major Public BDCs & Private Debt Funds
+    "HERCULES CAPITAL", "CION INVESTMENT", "ARES CAPITAL", "FS KKR", "OWL ROCK",
+    "BLUE OWL", "GOLUB CAPITAL", "MAIN STREET CAPITAL", "PROSPECT CAPITAL",
+    "OAKTREE", "BLACKROCK", "CAPITAL SOUTHWEST", "BARINGS", "BLACKSTONE",
+    "SLR INVESTMENT", "BAIN CAPITAL", "TRINITY CAPITAL", "MONROE CAPITAL",
+    "NEW MOUNTAIN FINANCE", "GLADSTONE INVESTMENT", "SARATOGA INVESTMENT",
+    "PENNANTPARK", "FORTRESS", "APOLLO", "KKR", "CARLYLE", "THOMA BRAVO",
+    
+    # Generic Fund Structures & Entity Suffixes
+    "INVESTMENT CORP", "CAPITAL CORP", "FINANCE CORP", "INCOME FUND",
+    "CREDIT FUND", "BDC", "REIT", "MANAGEMENT CORP", "ASSET MANAGEMENT",
+    "PARTNERS FUND", "OPPORTUNITY FUND", "HOLDINGS CORP"
+]
+
 # RSS News Sources
 RSS_FEEDS = [
     {"name": "DailyDAC Articles", "url": "https://www.dailydac.com/feed/"},
     {"name": "Bondoro Insights", "url": "https://bondoro.com/feed/"},
 ]
 
-# Credit Surveillance Keywords for News Scanning
+# Credit Surveillance Keywords
 DISTRESS_KEYWORDS = [
     "chapter 11", "bankruptcy", "distressed", "reorganization", "covenant breach",
     "amend and extend", "a&e", "lenders walk", "balks at", "forbearance",
     "distressed exchange", "restructuring", "non-accrual", "de facto default"
 ]
+
+def is_excluded_entity(entity_name):
+    """Returns True if the entity is a BDC, fund, or investment manager."""
+    name_upper = entity_name.upper()
+    return any(excluded in name_upper for excluded in EXCLUDED_ENTITIES)
 
 def get_lookback_dates():
     """Calculates 96-hour lookback on Mondays, 48-hour lookback Tuesday-Friday."""
@@ -37,7 +58,7 @@ def get_lookback_dates():
     return start_date, now
 
 def fetch_sec_edgar_events(start_dt, end_dt):
-    """Queries SEC EDGAR API for key distress phrases in recent 8-Ks with fixed JSON parsing."""
+    """Queries SEC EDGAR API for key distress phrases in recent 8-Ks, excluding fund entities."""
     results = []
     base_url = "https://efts.sec.gov/LATEST/search-index"
     phrases = ["going concern", "covenant breach", "chapter 11", "restructuring"]
@@ -60,18 +81,19 @@ def fetch_sec_edgar_events(start_dt, end_dt):
                 if response.status == 200:
                     data = json.loads(response.read().decode())
                     hits = data.get("hits", {}).get("hits", [])
-                    for hit in hits[:3]:
+                    for hit in hits:
                         src = hit.get("_source", {})
                         
-                        # --- FIX 1: Extract entity name correctly ---
                         display_names = src.get("display_names", [])
                         if display_names:
-                            # Usually formatted like "COMPANY NAME  (CIK 0001234567)"
                             entity_name = display_names[0].split("  (")[0].strip()
                         else:
                             entity_name = src.get("entity_name", "Unknown SEC Filer")
                         
-                        # --- FIX 2: Extract CIK and ADSH for valid URLs ---
+                        # --- EXCLUSION FILTER: Skip funds, BDCs, and asset managers ---
+                        if is_excluded_entity(entity_name):
+                            continue
+                        
                         cik_list = src.get("ciks", [])
                         cik = cik_list[0] if cik_list else src.get("cik", "")
                         adsh_raw = src.get("adsh", "")
@@ -105,14 +127,11 @@ def fetch_rss_bankruptcy_news(start_dt):
                 xml_data = response.read()
                 root = ET.fromstring(xml_data)
                 
-                # Parse RSS items
                 for item in root.findall(".//item"):
                     title = item.findtext("title", default="").strip()
                     link = item.findtext("link", default="").strip()
                     description = item.findtext("description", default="").strip()
-                    pub_date_str = item.findtext("pubDate", default="").strip()
 
-                    # Match against distress keywords
                     text_to_check = f"{title} {description}".lower()
                     matched_keywords = [kw for kw in DISTRESS_KEYWORDS if kw in text_to_check]
 
@@ -147,52 +166,53 @@ def run_surveillance(event=None, context=None):
     today_str = datetime.datetime.now().strftime("%B %d, %Y")
     start_dt, end_dt = get_lookback_dates()
     
-    # 1. Fetch SEC EDGAR Distress Events
+    # Fetch Data
     edgar_hits = fetch_sec_edgar_events(start_dt, end_dt)
-    
-    # 2. Fetch RSS Bankruptcy & Distress News
     rss_hits = fetch_rss_bankruptcy_news(start_dt)
     
-    # 3. Build Markdown Output
+    # ── CLEAN FORMATTING BUILDER ──
     digest_lines = [
-        f"BDC Loan Monitor — {today_str}",
+        f"BDC LOAN MONITOR — {today_str.upper()}",
         f"Lookback Window: {start_dt.strftime('%Y-%m-%d')} to {end_dt.strftime('%Y-%m-%d')}\n",
-        "---",
-        "\n### SEC EDGAR 8-K DISTRESS SIGNAL FLAGGING"
+        "════════════════════════════════════════════════════════════",
+        "  SECTION 1: SEC EDGAR 8-K DISTRESS SIGNALS (BORROWER HOLDINGS)",
+        "════════════════════════════════════════════════════════════\n"
     ]
     
     if edgar_hits:
-        # Deduplicate hits by entity and phrase
         seen_entities = set()
         for hit in edgar_hits:
             key = f"{hit['entity']}_{hit['phrase']}"
             if key not in seen_entities:
                 seen_entities.add(key)
-                digest_lines.append(f"\n🔴 **{hit['entity']}**")
-                digest_lines.append("  * AKA / Affiliates / DBAs: [Pending Master Mapping]")
-                digest_lines.append("  * BDC Exposure: None identified in initial sweep.")
-                digest_lines.append(f"  * Development: Filed Form 8-K matching trigger term '{hit['phrase']}'.")
-                digest_lines.append("  * Why it matters: Potential material corporate event, governance change, or debt agreement modification.")
-                digest_lines.append(f"  * Source: [SEC EDGAR Filing]({hit['url']})")
+                digest_lines.append(f"🔴 {hit['entity']}")
+                digest_lines.append(f"   AKA / Affiliates:  Pending Master Mapping")
+                digest_lines.append(f"   BDC Exposure:      None identified in initial sweep")
+                digest_lines.append(f"   Development:       Form 8-K trigger term \"{hit['phrase']}\"")
+                digest_lines.append(f"   Why It Matters:    Potential material corporate event, governance change, or debt modification")
+                digest_lines.append(f"   Source:            {hit['url']}\n")
     else:
-        digest_lines.append("No material SEC 8-K distress keywords surfaced in window.")
+        digest_lines.append("No underlying portfolio company 8-K distress keywords surfaced in window.\n")
 
-    digest_lines.append("\n---")
-    digest_lines.append("\n### BANKRUPTCY & PRIVATE DEBT NEWS FEEDS")
+    digest_lines.extend([
+        "════════════════════════════════════════════════════════════",
+        "  SECTION 2: BANKRUPTCY & PRIVATE DEBT NEWS FEEDS",
+        "════════════════════════════════════════════════════════════\n"
+    ])
 
     if rss_hits:
         for item in rss_hits:
-            digest_lines.append(f"\n🟡 **{item['title']}**")
-            digest_lines.append("  * AKA / Affiliates / DBAs: [Pending Master Mapping]")
-            digest_lines.append("  * BDC Exposure: None identified in initial sweep.")
-            digest_lines.append(f"  * Matched Terms: {', '.join(item['matches'])}")
-            digest_lines.append(f"  * Source: [{item['source_name']}]({item['link']})")
+            digest_lines.append(f"🟡 {item['title']}")
+            digest_lines.append(f"   AKA / Affiliates:  Pending Master Mapping")
+            digest_lines.append(f"   BDC Exposure:      None identified in initial sweep")
+            digest_lines.append(f"   Matched Terms:     {', '.join(item['matches'])}")
+            digest_lines.append(f"   Source:            {item['source_name']} ({item['link']})\n")
     else:
-        digest_lines.append("No bankruptcy/distress articles flagged from RSS feeds in window.")
+        digest_lines.append("No bankruptcy/distress articles flagged from RSS feeds in window.\n")
 
     digest_lines.extend([
-        "\n---",
-        "\nEnd of Daily Credit Monitor Report."
+        "════════════════════════════════════════════════════════════",
+        "End of Daily Surveillance Report."
     ])
     
     body = "\n".join(digest_lines)
@@ -201,6 +221,5 @@ def run_surveillance(event=None, context=None):
     send_email_digest(subject, body)
     return {"status": 200, "message": "Email sent successfully."}
 
-# Entry point for GitHub Actions or local test
 if __name__ == "__main__":
     run_surveillance()
